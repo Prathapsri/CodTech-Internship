@@ -1,16 +1,276 @@
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+#!/usr/bin/env bash
+set -euo pipefail
+# setup_task4_ethereum.sh
+#
+# Single-script setup for Task-4 (Private Ethereum + sample DApp)
+# - Uses Hardhat local node (private blockchain)
+# - Deploys SimpleStorage contract
+# - Writes deployed-addresses.json and creates a small frontend
+#
+# Usage:
+#   chmod +x setup_task4_ethereum.sh
+#   ./setup_task4_ethereum.sh
+#
+# Requirements:
+#   - node (>=16) and npm installed
+#   - bash shell
+#
+# After running:
+#   - Hardhat node runs in background (RPC at http://127.0.0.1:8545)
+#   - Frontend at Task-4-ethereum/frontend/index.html (open in browser)
+###############################################################################
 
-contract SimpleStorage {
-    uint256 public value;
-    event ValueSet(uint256 newValue, address indexed setter);
+ROOT="$(pwd)/Task-4-ethereum"
+echo "Creating Task-4 project at: $ROOT"
+mkdir -p "$ROOT"
+cd "$ROOT"
 
-    function set(uint256 newValue) external {
-        value = newValue;
-        emit ValueSet(newValue, msg.sender);
+echo "Initializing npm project..."
+# create package.json if not exists
+if [ ! -f package.json ]; then
+  npm init -y > /dev/null
+fi
+
+echo "Installing dev dependencies (hardhat, ethers) and OpenZeppelin (may take a minute)..."
+npm install --no-audit --no-fund --save-dev hardhat @nomiclabs/hardhat-ethers ethers > /dev/null
+npm install --no-audit --no-fund @openzeppelin/contracts > /dev/null
+
+echo "Creating directory layout..."
+mkdir -p contracts scripts frontend
+
+# hardhat config
+cat > hardhat.config.js <<'HH'
+require("@nomiclabs/hardhat-ethers");
+module.exports = {
+  solidity: "0.8.20",
+  networks: {
+    localhost: {
+      url: "http://127.0.0.1:8545"
     }
+  }
+};
+HH
 
-    function get() external view returns (uint256) {
-        return value;
-    }
+# SimpleStorage contract
+cat > contracts/SimpleStorage.sol <<'SOL'
+ // SPDX-License-Identifier: MIT
+ pragma solidity ^0.8.20;
+ 
+ contract SimpleStorage {
+     uint256 public value;
+     event ValueSet(uint256 newValue, address indexed setter);
+ 
+     function set(uint256 newValue) external {
+         value = newValue;
+         emit ValueSet(newValue, msg.sender);
+     }
+ 
+     function get() external view returns (uint256) {
+         return value;
+     }
+ }
+SOL
+
+# Deploy script (ethers + hardhat)
+cat > scripts/deploy.js <<'JS'
+async function main() {
+  const [deployer] = await ethers.getSigners();
+  console.log("Deploying with address:", deployer.address);
+
+  const SimpleStorage = await ethers.getContractFactory("SimpleStorage");
+  const storage = await SimpleStorage.deploy();
+  await storage.deployed();
+
+  console.log("SimpleStorage deployed to:", storage.address);
+
+  const fs = require('fs');
+  fs.writeFileSync('deployed-addresses.json', JSON.stringify({ SimpleStorage: storage.address }, null, 2));
+  console.log("Wrote deployed-addresses.json");
 }
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+JS
+
+echo "Compiling contracts..."
+npx hardhat compile
+
+echo "Starting Hardhat node in background (logs -> hardhat-node.log)..."
+# start node with nohup so it doesn't block; redirect logs
+nohup npx hardhat node > hardhat-node.log 2>&1 &
+
+# Wait for node to start
+echo "Waiting for Hardhat node to start..."
+sleep 4
+if ! grep -q "Started HTTP and WebSocket JSON-RPC server" hardhat-node.log 2>/dev/null; then
+  echo "Hardhat node may take a few seconds to start. Waiting additional 4s..."
+  sleep 4
+fi
+
+echo "Deploying contracts to local Hardhat node..."
+npx hardhat run scripts/deploy.js --network localhost
+
+echo ""
+echo "Deployed addresses:"
+cat deployed-addresses.json || true
+echo ""
+
+# Create frontend files
+cat > frontend/index.html <<'HTML'
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Task-4 SimpleStorage DApp</title>
+  <style>
+    body { font-family: Arial, Helvetica, sans-serif; padding: 20px; }
+    input { padding: 8px; margin-right: 8px; }
+    button { padding: 8px; margin-right: 8px; }
+    pre { background:#f6f6f6; padding:10px; }
+  </style>
+</head>
+<body>
+  <h2>Task-4 — SimpleStorage (Private Ethereum via Hardhat)</h2>
+  <p>Account: <span id="account">not connected</span></p>
+  <div>
+    <input id="val" placeholder="Enter number" />
+    <button id="setBtn">Set</button>
+    <button id="getBtn">Get</button>
+  </div>
+  <h3>Logs</h3>
+  <pre id="log"></pre>
+
+  <script src="https://cdn.jsdelivr.net/npm/ethers@6/dist/ethers.umd.min.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>
+HTML
+
+cat > frontend/app.js <<'JS'
+(async () => {
+  const logEl = document.getElementById('log');
+  const log = (t) => { logEl.innerText += t + "\n"; };
+
+  if (!window.ethereum) {
+    log("MetaMask not found. Install MetaMask and add RPC http://127.0.0.1:8545 (Chain ID 31337).");
+    return;
+  }
+
+  try {
+    await window.ethereum.request({ method: 'eth_requestAccounts' });
+    const provider = new ethers.BrowserProvider(window.ethereum);
+    const signer = await provider.getSigner();
+    const account = await signer.getAddress();
+    document.getElementById('account').innerText = account;
+    log("Connected: " + account);
+
+    // Load deployed address (file served from project root)
+    let addresses = {};
+    try {
+      addresses = await (await fetch('../deployed-addresses.json')).json();
+    } catch (e) {
+      log("Could not load deployed-addresses.json. Ensure you serve the project root (see README in output).");
+    }
+    const CONTRACT_ADDRESS = addresses.SimpleStorage || "<PASTE_SIMPLESTORAGE_ADDRESS_HERE>";
+    if (!CONTRACT_ADDRESS) {
+      log("No contract address found. Paste it into frontend/app.js or serve deployed-addresses.json.");
+      return;
+    }
+    log("Using contract: " + CONTRACT_ADDRESS);
+
+    const abi = [
+      "function set(uint256 newValue) external",
+      "function get() external view returns (uint256)"
+    ];
+    const contract = new ethers.Contract(CONTRACT_ADDRESS, abi, signer);
+
+    document.getElementById('setBtn').onclick = async () => {
+      const v = document.getElementById('val').value || "0";
+      const tx = await contract.set(v);
+      log("Tx sent: " + tx.hash);
+      await tx.wait();
+      log("Tx mined");
+    };
+
+    document.getElementById('getBtn').onclick = async () => {
+      const res = await contract.get();
+      log("Current value: " + res.toString());
+    };
+  } catch (err) {
+    log("Error: " + (err && err.message ? err.message : err));
+  }
+})();
+JS
+
+# Write a small README with steps
+cat > README-task4.txt <<'MD'
+Task-4 (Private Ethereum via Hardhat) — Quick start & deliverables
+
+Files created:
+- hardhat.config.js
+- contracts/SimpleStorage.sol
+- scripts/deploy.js
+- deployed-addresses.json
+- frontend/index.html
+- frontend/app.js
+- hardhat-node.log (Hardhat node log)
+- README-task4.txt (this file)
+
+What the script did:
+1. Installed Hardhat + ethers + OpenZeppelin
+2. Compiled SimpleStorage.sol
+3. Started a Hardhat local node (private blockchain) in background (RPC at http://127.0.0.1:8545)
+4. Deployed SimpleStorage to the local node and wrote deployed-addresses.json
+5. Created a minimal frontend in frontend/
+
+How to use (quick):
+1. Add Hardhat local RPC in MetaMask:
+   - RPC URL: http://127.0.0.1:8545
+   - Chain ID: 31337
+2. Open a new terminal and run:
+   tail -f hardhat-node.log
+   There you will see the Hardhat node accounts and private keys printed by the node at startup. Copy one private key and import into MetaMask (Import Account -> paste private key).
+3. Serve the project root so frontend can fetch deployed-addresses.json:
+   From the Task-4-ethereum directory run:
+     python3 -m http.server 8000
+   Then open: http://127.0.0.1:8000/frontend/index.html
+4. Use the UI:
+   - Connect MetaMask (account imported)
+   - Click "Get" to read stored value (initially 0)
+   - Enter a number and click "Set" — confirm in MetaMask and wait for transaction to mine
+   - Click "Get" again to read updated value
+
+Deliverables you can push to GitHub:
+- contracts/SimpleStorage.sol
+- scripts/deploy.js
+- hardhat.config.js
+- deployed-addresses.json (if deploying to a testnet; for local runs include it for demo)
+- frontend/* (index.html, app.js)
+- README-task4.txt with the exact steps you ran and screenshots
+MD
+
+echo "Setup finished."
+
+echo ""
+echo "Deployed addresses (if any):"
+cat deployed-addresses.json || echo "No deployed-addresses.json found."
+
+echo ""
+echo "IMPORTANT NEXT STEPS (read carefully):"
+echo "1) Serve the project root so frontend can fetch deployed-addresses.json:"
+echo "   python3 -m http.server 8000"
+echo "   Open: http://127.0.0.1:8000/frontend/index.html"
+echo ""
+echo "2) In MetaMask add network RPC: http://127.0.0.1:8545  Chain ID: 31337"
+echo "   Import one of the Hardhat node private keys (see hardhat-node.log or run 'npx hardhat node' manually to view keys)"
+echo ""
+echo "3) Tail the Hardhat node log to see its output:"
+echo "   tail -f hardhat-node.log"
+echo ""
+echo "If MetaMask account is not visible, run 'npx hardhat node' manually in another terminal to see the list of accounts and private keys, then import one into MetaMask."
+echo ""
+echo "To stop the background Hardhat node, find its PID and kill it (e.g. 'ps aux | grep hardhat' then kill <pid>)"
+echo ""
+echo "All done. Files are in: $ROOT"
