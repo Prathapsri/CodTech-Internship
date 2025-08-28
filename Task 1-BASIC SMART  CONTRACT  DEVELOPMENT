@@ -1,26 +1,97 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+/// @title SimpleToken - minimal ERC20 token for CodTech internship
+/// @notice Self-contained ERC-20-like token for learning & deployment on testnets
 contract SimpleToken {
-    string public name = "CodTech Token";
-    string public symbol = "CDT";
-    uint8 public decimals = 18;
+    // ERC-20 basic token data
+    string public name;
+    string public symbol;
+    uint8  public decimals;
     uint256 public totalSupply;
 
+    // Balances and allowances
     mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
 
+    // Events
     event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
 
-    constructor(uint256 initialSupply) {
-        totalSupply = initialSupply * (10 ** uint256(decimals));
-        balanceOf[msg.sender] = totalSupply; // give all tokens to deployer
+    /// @param _name Token name (e.g., "CodTech Token")
+    /// @param _symbol Token symbol (e.g., "CDT")
+    /// @param _initialSupplyWholeTokens Initial supply expressed in whole tokens (not including decimals)
+    constructor(string memory _name, string memory _symbol, uint256 _initialSupplyWholeTokens) {
+        name = _name;
+        symbol = _symbol;
+        decimals = 18;
+        // Convert whole tokens to smallest unit (wei-like)
+        totalSupply = _initialSupplyWholeTokens * (10 ** uint256(decimals));
+        balanceOf[msg.sender] = totalSupply;
+
+        // emit initial Transfer event from zero address
+        emit Transfer(address(0), msg.sender, totalSupply);
     }
 
-    function transfer(address to, uint256 value) public returns (bool success) {
-        require(balanceOf[msg.sender] >= value, "Not enough tokens");
-        balanceOf[msg.sender] -= value;
-        balanceOf[to] += value;
-        emit Transfer(msg.sender, to, value);
+    /// @notice Transfer tokens to another address
+    /// @param _to recipient
+    /// @param _value amount in smallest units (use e.g., 1 * 10**18 for 1 token)
+    function transfer(address _to, uint256 _value) external returns (bool) {
+        require(_to != address(0), "transfer to zero");
+        require(balanceOf[msg.sender] >= _value, "insufficient balance");
+
+        balanceOf[msg.sender] -= _value;
+        balanceOf[_to] += _value;
+
+        emit Transfer(msg.sender, _to, _value);
+        return true;
+    }
+
+    /// @notice Approve spender to spend tokens on your behalf
+    /// @param _spender allowed address
+    /// @param _value allowance amount (in smallest units)
+    function approve(address _spender, uint256 _value) external returns (bool) {
+        require(_spender != address(0), "approve zero address");
+        allowance[msg.sender][_spender] = _value;
+        emit Approval(msg.sender, _spender, _value);
+        return true;
+    }
+
+    /// @notice Transfer tokens on behalf of owner (requires allowance)
+    /// @param _from owner address
+    /// @param _to recipient
+    /// @param _value amount
+    function transferFrom(address _from, address _to, uint256 _value) external returns (bool) {
+        require(_from != address(0) && _to != address(0), "zero address");
+        require(balanceOf[_from] >= _value, "insufficient balance");
+        require(allowance[_from][msg.sender] >= _value, "allowance exceeded");
+
+        balanceOf[_from] -= _value;
+        balanceOf[_to] += _value;
+        allowance[_from][msg.sender] -= _value;
+
+        emit Transfer(_from, _to, _value);
+        return true;
+    }
+
+    /// @notice Increase allowance (safer pattern than resetting)
+    function increaseAllowance(address _spender, uint256 _addedValue) external returns (bool) {
+        require(_spender != address(0), "zero address");
+        allowance[msg.sender][_spender] += _addedValue;
+        emit Approval(msg.sender, _spender, allowance[msg.sender][_spender]);
+        return true;
+    }
+
+    /// @notice Decrease allowance
+    function decreaseAllowance(address _spender, uint256 _subtractedValue) external returns (bool) {
+        require(_spender != address(0), "zero address");
+        uint256 current = allowance[msg.sender][_spender];
+        if (_subtractedValue >= current) {
+            allowance[msg.sender][_spender] = 0;
+        } else {
+            allowance[msg.sender][_spender] = current - _subtractedValue;
+        }
+        emit Approval(msg.sender, _spender, allowance[msg.sender][_spender]);
         return true;
     }
 }
