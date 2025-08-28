@@ -1,0 +1,181 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+/*
+ Simple LendingPool:
+ - Single ERC20 token pool
+ - Lenders deposit tokens to increase pool liquidity
+ - Borrowers can borrow (if collateralless for this simple demo) up to pool liquidity
+ - Interest accrues over time; interest rate is dynamic based on utilization:
+    utilization = totalBorrows / (totalLiquidity)  (1e18 fixed point)
+    borrowRatePerYear = baseRate + slope * utilization
+ - interest is accrued to borrows; lenders earn interest proportionally when they withdraw.
+ NOTE: This is a simple educational implementation — not production-grade.
+*/
+
+contract LendingPool is Ownable {
+    IERC20 public token;
+
+    uint256 public totalLiquidity;      // tokens deposited, excluding outstanding borrows
+    uint256 public totalBorrows;        // borrowed amount (principal + accrued interest is updated on accrue)
+    uint256 public lastAccrualTimestamp;
+
+    // fixed point 1e18
+    uint256 public constant WAD = 1e18;
+
+    // rate params (per year, fixed point)
+    uint256 public baseRatePerYear;  // e.g., 0.02 * 1e18 = 2% base
+    uint256 public slopePerYear;     // slope for utilization, e.g., 0.2 * 1e18 = 20%
+
+    mapping(address => uint256) public deposits;
+    mapping(address => uint256) public borrows;
+    mapping(address => uint256) public borrowIndexAt; // to track individual accrued borrow share
+
+    // cumulative index to convert individual borrows to up-to-date amount
+    uint256 public borrowIndex; // fixed point, starts at 1e18
+
+    event Deposit(address indexed user, uint256 amount);
+    event Withdraw(address indexed user, uint256 amount);
+    event Borrow(address indexed user, uint256 amount);
+    event Repay(address indexed user, uint256 amount);
+    event Accrue(uint256 interestAccrued, uint256 newBorrowIndex);
+
+    constructor(IERC20 _token, uint256 _baseRatePerYear, uint256 _slopePerYear) {
+        token = _token;
+        baseRatePerYear = _baseRatePerYear; // e.g., 0.02e18
+        slopePerYear = _slopePerYear;       // e.g., 0.2e18
+        lastAccrualTimestamp = block.timestamp;
+        borrowIndex = WAD;
+    }
+
+    // compute utilization: totalBorrows / (totalLiquidity + totalBorrows)
+    function utilization() public view returns (uint256) {
+        uint256 total = totalLiquidity + totalBorrows;
+        if (total == 0) return 0;
+        return (totalBorrows * WAD) / total; // 1e18 fixed
+    }
+
+    // per-year borrow rate = base + slope * utilization
+    function borrowRatePerYear() public view returns (uint256) {
+        uint256 u = utilization(); // 1e18
+        // slope * u / 1e18
+        uint256 slopeTimesU = (slopePerYear * u) / WAD;
+        return baseRatePerYear + slopeTimesU; // per year (1e18)
+    }
+
+    // accrue interest since lastAccrualTimestamp; updates totalBorrows and borrowIndex
+    function accrueInterest() public {
+        uint256 ts = block.timestamp;
+        if (ts <= lastAccrualTimestamp) return;
+        uint256 delta = ts - lastAccrualTimestamp;
+
+        uint256 annualRate = borrowRatePerYear(); // 1e18
+        // interest factor = (annualRate * delta) / secondsPerYear
+        uint256 secondsPerYear = 31536000;
+        uint256 interestFactor = (annualRate * delta) / secondsPerYear; // 1e18 scale
+
+        // interestAccrued = totalBorrows * interestFactor / 1e18
+        uint256 interestAccrued = (totalBorrows * interestFactor) / WAD;
+
+        totalBorrows += interestAccrued;
+
+        // update borrowIndex: borrowIndex *= (1 + interestFactor)
+        // newIndex = borrowIndex * (1e18 + interestFactor) / 1e18
+        borrowIndex = (borrowIndex * (WAD + interestFactor)) / WAD;
+
+        lastAccrualTimestamp = ts;
+        emit Accrue(interestAccrued, borrowIndex);
+    }
+
+    // deposit tokens to pool
+    function deposit(uint256 amount) external {
+        require(amount > 0, "amount>0");
+        accrueInterest();
+        token.transferFrom(msg.sender, address(this), amount);
+        deposits[msg.sender] += amount;
+        totalLiquidity += amount;
+        emit Deposit(msg.sender, amount);
+    }
+
+    // withdraw tokens (principal + earned interest proportionally)
+    function withdraw(uint256 amount) external {
+        require(amount > 0, "amount>0");
+        accrueInterest();
+        require(deposits[msg.sender] >= amount, "insufficient deposit");
+        deposits[msg.sender] -= amount;
+        totalLiquidity -= amount;
+        token.transfer(msg.sender, amount);
+        emit Withdraw(msg.sender, amount);
+    }
+
+    // borrow from pool (simple, no collateral in demo) — up to available liquidity
+    function borrow(uint256 amount) external {
+        require(amount > 0, "amount>0");
+        accrueInterest();
+        require(amount <= totalLiquidity, "not enough liquidity");
+        // update borrower record scaled by current borrowIndex
+        // store the borrows in raw principal units; to track accrual we use borrowIndexAt for each borrower
+        borrows[msg.sender] += amount;
+        borrowIndexAt[msg.sender] = borrowIndex;
+        totalBorrows += amount;
+        totalLiquidity -= amount;
+        token.transfer(msg.sender, amount);
+        emit Borrow(msg.sender, amount);
+    }
+
+    // repay borrowed amount (repays principal + interest portion implicitly via accrue)
+    function repay(uint256 amount) external {
+        require(amount > 0, "amount>0");
+        accrueInterest();
+        uint256 owed = currentBorrowBalance(msg.sender);
+        require(owed > 0, "no borrow");
+        uint256 pay = amount;
+        if (pay > owed) pay = owed;
+        // apply payment to reduce totalBorrows and borrower's principal proportionally
+        // We'll reduce borrower's principal first (simple)
+        // convert owed and principal to scale to determine principal reduction
+        // For simplicity in this demo, we'll reduce borrows[msg.sender] by pay (but borrows[] stores principal without index)
+        // This is an educational simplification.
+        if (pay >= borrows[msg.sender]) {
+            // fully repay
+            uint256 principal = borrows[msg.sender];
+            borrows[msg.sender] = 0;
+            // reduce totalBorrows by pay (which includes interest) but safe-guard
+            if (pay <= totalBorrows) totalBorrows -= pay;
+            else totalBorrows = 0;
+        } else {
+            borrows[msg.sender] -= pay;
+            if (pay <= totalBorrows) totalBorrows -= pay;
+            else totalBorrows = 0;
+        }
+        token.transferFrom(msg.sender, address(this), pay);
+        totalLiquidity += pay;
+        emit Repay(msg.sender, pay);
+    }
+
+    // view current borrow balance (very simplified, using borrowIndex ratio)
+    function currentBorrowBalance(address user) public view returns (uint256) {
+        // In a full implementation you'd store user's principal * borrowIndexAt and compute interest.
+        // For this demo, we'll approximate: principal * (borrowIndex / borrowIndexAt)
+        uint256 p = borrows[user];
+        if (p == 0) return 0;
+        uint256 idxAt = borrowIndexAt[user];
+        if (idxAt == 0) idxAt = WAD;
+        return (p * borrowIndex) / idxAt;
+    }
+
+    // owner can update params (for demo)
+    function setRates(uint256 _baseRatePerYear, uint256 _slopePerYear) external onlyOwner {
+        baseRatePerYear = _baseRatePerYear;
+        slopePerYear = _slopePerYear;
+    }
+
+    // emergency: owner can withdraw accumulated tokens
+    function ownerWithdraw(uint256 amount) external onlyOwner {
+        require(amount <= token.balanceOf(address(this)), "insufficient");
+        token.transfer(msg.sender, amount);
+    }
+}
