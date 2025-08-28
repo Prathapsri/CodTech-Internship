@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+/// @title Custom ERC20 Token for CodTech Internship
+/// @notice Standard ERC20 with initial supply minted to deployer
+contract CustomToken is ERC20, Ownable {
+    constructor(
+        string memory name_,
+        string memory symbol_,
+        uint256 initialSupplyWholeTokens
+    ) ERC20(name_, symbol_) {
+        _mint(msg.sender, initialSupplyWholeTokens * (10 ** decimals()));
+    }
+
+    /// @notice Mint more tokens (only deployer/owner can call this)
+    function mint(address to, uint256 amountWholeTokens) external onlyOwner {
+        _mint(to, amountWholeTokens * (10 ** decimals()));
+    }
+}
+
+
+# Task-2 — Custom ERC20 Token (CodTech Internship)
+
+## Token Details
+- Name: CodTech Custom Token
+- Symbol: CCT
+- Decimals: 18
+- Initial Supply: 1,000,000 CCT
+
+## Contract
+- File: CustomToken.sol
+- Solidity Version: 0.8.20
+- Standard: ERC-20 (OpenZeppelin)
+
+## Deployment
+- Network: Sepolia Testnet
+- Contract Address: <paste after deploy>
+- Transaction Hash: <paste after deploy>
+- Deployer Address: <your wallet address>
+
+## Proof
+- Screenshot: Remix deployment page / MetaMask confirmation
+- Link: [Sepolia Etherscan](https://sepolia.etherscan.io/) (search by contract address)
+
