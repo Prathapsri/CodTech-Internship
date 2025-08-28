@@ -1,181 +1,371 @@
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+#!/usr/bin/env bash
+set -e
 
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
+# Single script to create a minimal Task-3 Hardhat project, start a local node, deploy contracts, and scaffold a tiny frontend.
+# Save as setup_task3_local.sh, chmod +x, then run: ./setup_task3_local.sh
 
-/*
- Simple LendingPool:
- - Single ERC20 token pool
- - Lenders deposit tokens to increase pool liquidity
- - Borrowers can borrow (if collateralless for this simple demo) up to pool liquidity
- - Interest accrues over time; interest rate is dynamic based on utilization:
-    utilization = totalBorrows / (totalLiquidity)  (1e18 fixed point)
-    borrowRatePerYear = baseRate + slope * utilization
- - interest is accrued to borrows; lenders earn interest proportionally when they withdraw.
- NOTE: This is a simple educational implementation — not production-grade.
-*/
+ROOT_DIR="$(pwd)/Task-3"
+echo "Creating Task-3 project at: $ROOT_DIR"
+mkdir -p "$ROOT_DIR"
+cd "$ROOT_DIR"
 
-contract LendingPool is Ownable {
-    IERC20 public token;
+echo "Initializing npm project..."
+npm init -y > /dev/null
 
-    uint256 public totalLiquidity;      // tokens deposited, excluding outstanding borrows
-    uint256 public totalBorrows;        // borrowed amount (principal + accrued interest is updated on accrue)
-    uint256 public lastAccrualTimestamp;
+echo "Installing dependencies (this may take a minute)..."
+# Hardhat + ethers + OpenZeppelin. Using local installs to keep everything in this folder.
+npm install --save-dev hardhat @nomiclabs/hardhat-ethers ethers > /dev/null
+npm install @openzeppelin/contracts > /dev/null
 
-    // fixed point 1e18
-    uint256 public constant WAD = 1e18;
+# Create minimal hardhat project files
+echo "Creating contracts and config..."
 
-    // rate params (per year, fixed point)
-    uint256 public baseRatePerYear;  // e.g., 0.02 * 1e18 = 2% base
-    uint256 public slopePerYear;     // slope for utilization, e.g., 0.2 * 1e18 = 20%
+mkdir -p contracts scripts frontend
 
-    mapping(address => uint256) public deposits;
-    mapping(address => uint256) public borrows;
-    mapping(address => uint256) public borrowIndexAt; // to track individual accrued borrow share
-
-    // cumulative index to convert individual borrows to up-to-date amount
-    uint256 public borrowIndex; // fixed point, starts at 1e18
-
-    event Deposit(address indexed user, uint256 amount);
-    event Withdraw(address indexed user, uint256 amount);
-    event Borrow(address indexed user, uint256 amount);
-    event Repay(address indexed user, uint256 amount);
-    event Accrue(uint256 interestAccrued, uint256 newBorrowIndex);
-
-    constructor(IERC20 _token, uint256 _baseRatePerYear, uint256 _slopePerYear) {
-        token = _token;
-        baseRatePerYear = _baseRatePerYear; // e.g., 0.02e18
-        slopePerYear = _slopePerYear;       // e.g., 0.2e18
-        lastAccrualTimestamp = block.timestamp;
-        borrowIndex = WAD;
+cat > hardhat.config.js <<'HH'
+require("@nomiclabs/hardhat-ethers");
+module.exports = {
+  solidity: "0.8.20",
+  networks: {
+    localhost: {
+      url: "http://127.0.0.1:8545"
     }
+  }
+};
+HH
 
-    // compute utilization: totalBorrows / (totalLiquidity + totalBorrows)
-    function utilization() public view returns (uint256) {
-        uint256 total = totalLiquidity + totalBorrows;
-        if (total == 0) return 0;
-        return (totalBorrows * WAD) / total; // 1e18 fixed
-    }
+cat > contracts/MockERC20.sol <<'SOL'
+ // SPDX-License-Identifier: MIT
+ pragma solidity ^0.8.20;
+ import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+ contract MockERC20 is ERC20 {
+     constructor(string memory name_, string memory symbol_, uint256 initial) ERC20(name_, symbol_) {
+         _mint(msg.sender, initial);
+     }
+     function faucet(address to, uint256 amount) external {
+         _mint(to, amount);
+     }
+ }
+SOL
 
-    // per-year borrow rate = base + slope * utilization
-    function borrowRatePerYear() public view returns (uint256) {
-        uint256 u = utilization(); // 1e18
-        // slope * u / 1e18
-        uint256 slopeTimesU = (slopePerYear * u) / WAD;
-        return baseRatePerYear + slopeTimesU; // per year (1e18)
-    }
+cat > contracts/LendingPool.sol <<'SOL'
+ // SPDX-License-Identifier: MIT
+ pragma solidity ^0.8.20;
+ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+ import "@openzeppelin/contracts/access/Ownable.sol";
+ contract LendingPool is Ownable {
+     IERC20 public token;
+     uint256 public totalLiquidity;
+     uint256 public totalBorrows;
+     uint256 public lastAccrualTimestamp;
+     uint256 public constant WAD = 1e18;
+     uint256 public baseRatePerYear;
+     uint256 public slopePerYear;
+     mapping(address => uint256) public deposits;
+     mapping(address => uint256) public borrows;
+     mapping(address => uint256) public borrowIndexAt;
+     uint256 public borrowIndex;
+     event Deposit(address indexed user, uint256 amount);
+     event Withdraw(address indexed user, uint256 amount);
+     event Borrow(address indexed user, uint256 amount);
+     event Repay(address indexed user, uint256 amount);
+     event Accrue(uint256 interestAccrued, uint256 newBorrowIndex);
+     constructor(address _token, uint256 _baseRatePerYear, uint256 _slopePerYear) {
+         token = IERC20(_token);
+         baseRatePerYear = _baseRatePerYear;
+         slopePerYear = _slopePerYear;
+         lastAccrualTimestamp = block.timestamp;
+         borrowIndex = WAD;
+     }
+     function utilization() public view returns (uint256) {
+         uint256 total = totalLiquidity + totalBorrows;
+         if (total == 0) return 0;
+         return (totalBorrows * WAD) / total;
+     }
+     function borrowRatePerYear() public view returns (uint256) {
+         uint256 u = utilization();
+         uint256 slopeTimesU = (slopePerYear * u) / WAD;
+         return baseRatePerYear + slopeTimesU;
+     }
+     function accrueInterest() public {
+         uint256 ts = block.timestamp;
+         if (ts <= lastAccrualTimestamp) return;
+         uint256 delta = ts - lastAccrualTimestamp;
+         uint256 annualRate = borrowRatePerYear();
+         uint256 secondsPerYear = 31536000;
+         uint256 interestFactor = (annualRate * delta) / secondsPerYear;
+         uint256 interestAccrued = (totalBorrows * interestFactor) / WAD;
+         totalBorrows += interestAccrued;
+         borrowIndex = (borrowIndex * (WAD + interestFactor)) / WAD;
+         lastAccrualTimestamp = ts;
+         emit Accrue(interestAccrued, borrowIndex);
+     }
+     function deposit(uint256 amount) external {
+         require(amount > 0, "amount>0");
+         accrueInterest();
+         bool ok = token.transferFrom(msg.sender, address(this), amount);
+         require(ok, "transferFrom failed");
+         deposits[msg.sender] += amount;
+         totalLiquidity += amount;
+         emit Deposit(msg.sender, amount);
+     }
+     function withdraw(uint256 amount) external {
+         require(amount > 0, "amount>0");
+         accrueInterest();
+         require(deposits[msg.sender] >= amount, "insufficient deposit");
+         deposits[msg.sender] -= amount;
+         totalLiquidity -= amount;
+         bool ok = token.transfer(msg.sender, amount);
+         require(ok, "transfer failed");
+         emit Withdraw(msg.sender, amount);
+     }
+     function borrow(uint256 amount) external {
+         require(amount > 0, "amount>0");
+         accrueInterest();
+         require(amount <= totalLiquidity, "not enough liquidity");
+         borrows[msg.sender] += amount;
+         borrowIndexAt[msg.sender] = borrowIndex;
+         totalBorrows += amount;
+         totalLiquidity -= amount;
+         bool ok = token.transfer(msg.sender, amount);
+         require(ok, "transfer failed");
+         emit Borrow(msg.sender, amount);
+     }
+     function repay(uint256 amount) external {
+         require(amount > 0, "amount>0");
+         accrueInterest();
+         uint256 owed = currentBorrowBalance(msg.sender);
+         require(owed > 0, "no borrow");
+         uint256 pay = amount;
+         if (pay > owed) pay = owed;
+         if (pay >= borrows[msg.sender]) {
+             borrows[msg.sender] = 0;
+             if (pay <= totalBorrows) totalBorrows -= pay;
+             else totalBorrows = 0;
+         } else {
+             borrows[msg.sender] -= pay;
+             if (pay <= totalBorrows) totalBorrows -= pay;
+             else totalBorrows = 0;
+         }
+         bool ok = token.transferFrom(msg.sender, address(this), pay);
+         require(ok, "transferFrom failed");
+         totalLiquidity += pay;
+         emit Repay(msg.sender, pay);
+     }
+     function currentBorrowBalance(address user) public view returns (uint256) {
+         uint256 p = borrows[user];
+         if (p == 0) return 0;
+         uint256 idxAt = borrowIndexAt[user];
+         if (idxAt == 0) idxAt = WAD;
+         return (p * borrowIndex) / idxAt;
+     }
+     function setRates(uint256 _baseRatePerYear, uint256 _slopePerYear) external onlyOwner {
+         baseRatePerYear = _baseRatePerYear;
+         slopePerYear = _slopePerYear;
+     }
+     function ownerWithdraw(uint256 amount) external onlyOwner {
+         require(amount <= token.balanceOf(address(this)), "insufficient");
+         token.transfer(msg.sender, amount);
+     }
+ }
+SOL
 
-    // accrue interest since lastAccrualTimestamp; updates totalBorrows and borrowIndex
-    function accrueInterest() public {
-        uint256 ts = block.timestamp;
-        if (ts <= lastAccrualTimestamp) return;
-        uint256 delta = ts - lastAccrualTimestamp;
+cat > scripts/deploy.js <<'JS'
+async function main() {
+  const [deployer] = await ethers.getSigners();
+  console.log("Deployer address:", deployer.address);
 
-        uint256 annualRate = borrowRatePerYear(); // 1e18
-        // interest factor = (annualRate * delta) / secondsPerYear
-        uint256 secondsPerYear = 31536000;
-        uint256 interestFactor = (annualRate * delta) / secondsPerYear; // 1e18 scale
+  // Deploy MockERC20
+  const Mock = await ethers.getContractFactory("MockERC20");
+  const initial = ethers.parseUnits("1000000", 18); // 1,000,000 tokens
+  const mock = await Mock.deploy("Demo Token", "DMT", initial);
+  await mock.deployed();
+  console.log("MockERC20 deployed:", mock.address);
 
-        // interestAccrued = totalBorrows * interestFactor / 1e18
-        uint256 interestAccrued = (totalBorrows * interestFactor) / WAD;
+  // Deploy LendingPool with baseRate 2% and slope 20% (scaled by 1e18)
+  const base = ethers.parseUnits("0.02", 18);
+  const slope = ethers.parseUnits("0.2", 18);
+  const Pool = await ethers.getContractFactory("LendingPool");
+  const pool = await Pool.deploy(mock.address, base, slope);
+  await pool.deployed();
+  console.log("LendingPool deployed:", pool.address);
 
-        totalBorrows += interestAccrued;
+  // Approve + deposit some tokens to seed the pool
+  const depositAmount = ethers.parseUnits("100000", 18); // 100k
+  let tx = await mock.approve(pool.address, depositAmount);
+  await tx.wait();
+  tx = await pool.deposit(depositAmount);
+  await tx.wait();
+  console.log("Deposited to pool:", depositAmount.toString());
 
-        // update borrowIndex: borrowIndex *= (1 + interestFactor)
-        // newIndex = borrowIndex * (1e18 + interestFactor) / 1e18
-        borrowIndex = (borrowIndex * (WAD + interestFactor)) / WAD;
-
-        lastAccrualTimestamp = ts;
-        emit Accrue(interestAccrued, borrowIndex);
-    }
-
-    // deposit tokens to pool
-    function deposit(uint256 amount) external {
-        require(amount > 0, "amount>0");
-        accrueInterest();
-        token.transferFrom(msg.sender, address(this), amount);
-        deposits[msg.sender] += amount;
-        totalLiquidity += amount;
-        emit Deposit(msg.sender, amount);
-    }
-
-    // withdraw tokens (principal + earned interest proportionally)
-    function withdraw(uint256 amount) external {
-        require(amount > 0, "amount>0");
-        accrueInterest();
-        require(deposits[msg.sender] >= amount, "insufficient deposit");
-        deposits[msg.sender] -= amount;
-        totalLiquidity -= amount;
-        token.transfer(msg.sender, amount);
-        emit Withdraw(msg.sender, amount);
-    }
-
-    // borrow from pool (simple, no collateral in demo) — up to available liquidity
-    function borrow(uint256 amount) external {
-        require(amount > 0, "amount>0");
-        accrueInterest();
-        require(amount <= totalLiquidity, "not enough liquidity");
-        // update borrower record scaled by current borrowIndex
-        // store the borrows in raw principal units; to track accrual we use borrowIndexAt for each borrower
-        borrows[msg.sender] += amount;
-        borrowIndexAt[msg.sender] = borrowIndex;
-        totalBorrows += amount;
-        totalLiquidity -= amount;
-        token.transfer(msg.sender, amount);
-        emit Borrow(msg.sender, amount);
-    }
-
-    // repay borrowed amount (repays principal + interest portion implicitly via accrue)
-    function repay(uint256 amount) external {
-        require(amount > 0, "amount>0");
-        accrueInterest();
-        uint256 owed = currentBorrowBalance(msg.sender);
-        require(owed > 0, "no borrow");
-        uint256 pay = amount;
-        if (pay > owed) pay = owed;
-        // apply payment to reduce totalBorrows and borrower's principal proportionally
-        // We'll reduce borrower's principal first (simple)
-        // convert owed and principal to scale to determine principal reduction
-        // For simplicity in this demo, we'll reduce borrows[msg.sender] by pay (but borrows[] stores principal without index)
-        // This is an educational simplification.
-        if (pay >= borrows[msg.sender]) {
-            // fully repay
-            uint256 principal = borrows[msg.sender];
-            borrows[msg.sender] = 0;
-            // reduce totalBorrows by pay (which includes interest) but safe-guard
-            if (pay <= totalBorrows) totalBorrows -= pay;
-            else totalBorrows = 0;
-        } else {
-            borrows[msg.sender] -= pay;
-            if (pay <= totalBorrows) totalBorrows -= pay;
-            else totalBorrows = 0;
-        }
-        token.transferFrom(msg.sender, address(this), pay);
-        totalLiquidity += pay;
-        emit Repay(msg.sender, pay);
-    }
-
-    // view current borrow balance (very simplified, using borrowIndex ratio)
-    function currentBorrowBalance(address user) public view returns (uint256) {
-        // In a full implementation you'd store user's principal * borrowIndexAt and compute interest.
-        // For this demo, we'll approximate: principal * (borrowIndex / borrowIndexAt)
-        uint256 p = borrows[user];
-        if (p == 0) return 0;
-        uint256 idxAt = borrowIndexAt[user];
-        if (idxAt == 0) idxAt = WAD;
-        return (p * borrowIndex) / idxAt;
-    }
-
-    // owner can update params (for demo)
-    function setRates(uint256 _baseRatePerYear, uint256 _slopePerYear) external onlyOwner {
-        baseRatePerYear = _baseRatePerYear;
-        slopePerYear = _slopePerYear;
-    }
-
-    // emergency: owner can withdraw accumulated tokens
-    function ownerWithdraw(uint256 amount) external onlyOwner {
-        require(amount <= token.balanceOf(address(this)), "insufficient");
-        token.transfer(msg.sender, amount);
-    }
+  // Save addresses
+  const fs = require("fs");
+  const addresses = { token: mock.address, pool: pool.address };
+  fs.writeFileSync("deployed-addresses.json", JSON.stringify(addresses, null, 2));
+  console.log("Addresses saved to deployed-addresses.json");
 }
+
+main().catch((e) => { console.error(e); process.exit(1); });
+JS
+
+echo "Compiling contracts..."
+npx hardhat compile
+
+# Start Hardhat node in background using nohup so the script can continue to deploy to it.
+# Redirect logs into hardhat-node.log
+echo "Starting Hardhat node in background (log -> hardhat-node.log)..."
+nohup npx hardhat node > hardhat-node.log 2>&1 &
+
+# Wait for node to boot
+echo "Waiting for Hardhat node to start..."
+sleep 5
+# check if node started
+if ! grep -q "Started HTTP and WebSocket JSON-RPC server" hardhat-node.log 2>/dev/null; then
+  echo "Hardhat node may not be ready yet. Sleeping a bit more..."
+  sleep 4
+fi
+
+echo "Running deploy script (to localhost network)..."
+npx hardhat run scripts/deploy.js --network localhost
+
+# show the deployed addresses
+echo "Deployed addresses:"
+cat deployed-addresses.json || true
+
+# Create a simple frontend that uses ethers (umd) to interact with contracts
+cat > frontend/index.html <<'HTML'
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Task-3 Lending DApp (Demo)</title>
+</head>
+<body>
+  <h2>CodTech Lending DApp (Demo)</h2>
+  <p id="account">Not connected</p>
+  <input id="amt" placeholder="Amount (whole tokens)" />
+  <button id="faucetBtn">Faucet 1000 DMT to me</button>
+  <button id="approveDeposit">Approve & Deposit</button>
+  <button id="borrowBtn">Borrow</button>
+  <button id="repayBtn">Repay</button>
+  <pre id="log"></pre>
+
+  <script src="https://cdn.jsdelivr.net/npm/ethers@6.9.0/dist/ethers.umd.min.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>
+HTML
+
+cat > frontend/app.js <<'JS'
+(async ()=> {
+  const log = (t)=> { document.getElementById('log').innerText += t + "\n"; };
+  if (!window.ethereum) {
+    log("Install MetaMask and connect to http://127.0.0.1:8545 (Hardhat).");
+    return;
+  }
+
+  const provider = new ethers.BrowserProvider(window.ethereum);
+  await provider.send("eth_requestAccounts", []);
+  const signer = await provider.getSigner();
+  const acct = await signer.getAddress();
+  document.getElementById('account').innerText = "Connected: " + acct;
+  log("Connected as " + acct);
+
+  // load addresses
+  let addresses = {};
+  try {
+    addresses = await (await fetch('../deployed-addresses.json')).json();
+  } catch (e) {
+    log("Could not load deployed-addresses.json from project root. Make sure file exists.");
+  }
+  const TOKEN = addresses.token;
+  const POOL = addresses.pool;
+  if (!TOKEN || !POOL) {
+    log("Missing addresses. Open deployed-addresses.json and paste token/pool into frontend/app.js or serve root so fetch works.");
+    return;
+  }
+  log("Token: " + TOKEN);
+  log("Pool: " + POOL);
+
+  const poolAbi = [
+    "function deposit(uint256 amount) external",
+    "function withdraw(uint256 amount) external",
+    "function borrow(uint256 amount) external",
+    "function repay(uint256 amount) external",
+    "function currentBorrowBalance(address user) view returns (uint256)"
+  ];
+  const tokenAbi = [
+    "function faucet(address to, uint256 amount) external",
+    "function approve(address spender, uint256 amount) external",
+    "function balanceOf(address) view returns (uint256)",
+    "event Transfer(address indexed from, address indexed to, uint256 value)"
+  ];
+
+  const token = new ethers.Contract(TOKEN, tokenAbi, signer);
+  const pool = new ethers.Contract(POOL, poolAbi, signer);
+
+  document.getElementById('faucetBtn').onclick = async () => {
+    const amt = ethers.parseUnits("1000", 18);
+    const tx = await token.faucet(acct, amt);
+    await tx.wait();
+    log("Faucet minted 1000 DMT to " + acct);
+    const bal = await token.balanceOf(acct);
+    log("Balance: " + ethers.formatUnits(bal, 18));
+  };
+
+  document.getElementById('approveDeposit').onclick = async () => {
+    const v = document.getElementById('amt').value || "1";
+    const amt = ethers.parseUnits(v, 18);
+    const tx1 = await token.approve(POOL, amt);
+    await tx1.wait();
+    const tx2 = await pool.deposit(amt);
+    await tx2.wait();
+    log("Deposited " + v + " DMT to pool");
+  };
+
+  document.getElementById('borrowBtn').onclick = async () => {
+    const v = document.getElementById('amt').value || "1";
+    const amt = ethers.parseUnits(v, 18);
+    const tx = await pool.borrow(amt);
+    await tx.wait();
+    log("Borrowed " + v + " DMT from pool");
+  };
+
+  document.getElementById('repayBtn').onclick = async () => {
+    const v = document.getElementById('amt').value || "1";
+    const amt = ethers.parseUnits(v, 18);
+    // approve then repay
+    const tx1 = await token.approve(POOL, amt);
+    await tx1.wait();
+    const tx2 = await pool.repay(amt);
+    await tx2.wait();
+    log("Repayed " + v + " DMT to pool");
+  };
+})();
+JS
+
+# Provide instructions at the end
+echo "Setup complete."
+echo ""
+echo "Files created under: $ROOT_DIR"
+echo ""
+echo "1) Hardhat node started in background (log -> hardhat-node.log)."
+echo "   To see the node logs: tail -f hardhat-node.log"
+echo ""
+echo "2) Contracts compiled and deployed. Addresses (deployed-addresses.json):"
+cat deployed-addresses.json || true
+echo ""
+echo "3) Frontend created at: $ROOT_DIR/frontend"
+echo "   - To use: Add Hardhat accounts into MetaMask (import private key from Hardhat node output)."
+echo "   - Open frontend/index.html in a browser (file:// should work) OR serve the project root with a simple static server."
+echo ""
+echo "Useful commands:"
+echo "  # show node logs"
+echo "  tail -f hardhat-node.log"
+echo ""
+echo "  # stop the background hardhat node (find process and kill if needed)"
+echo "  ps aux | grep 'hardhat'  # then kill <pid>"
+echo ""
+echo "If MetaMask cannot show accounts, open a new terminal and run 'npx hardhat node' manually to see the private keys and copy one into MetaMask."
+echo ""
+echo "Done."
